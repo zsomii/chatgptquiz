@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import Quiz from './Quiz';
+import './App.css';
 
 function App() {
   const [name, setName] = useState('');
@@ -23,7 +24,7 @@ function App() {
 
   if (!submitted) {
     return (
-      <div style={{ padding: '2rem', textAlign: 'center' }}>
+      <div className="quiz-container" style={{ textAlign: 'center' }}>
         <h2>Mi a neved?</h2>
         <form onSubmit={handleSubmit}>
           <input
@@ -32,17 +33,17 @@ function App() {
             onChange={(e) => setName(e.target.value)}
             required
             placeholder="Add meg a neved"
-            style={{ padding: '0.5rem', fontSize: '1rem' }}
           />
-          <br /><br />
-          <button type="submit" style={{ padding: '0.5rem 1rem' }}>Kezdés</button>
+          <br />
+          <br />
+          <button type="submit">Kezdés</button>
         </form>
       </div>
     );
   }
 
   return (
-    <div>
+    <div className="quiz-container">
       <div style={{ padding: '1rem', textAlign: 'center' }}>
         <h2>Szia, {name}!</h2>
       </div>
