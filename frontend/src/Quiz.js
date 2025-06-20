@@ -4,3 +4,5 @@
     <p>{score} pontot szereztél ebben az órában.</p>
   </div>
 )}
+
+export default Quiz;
