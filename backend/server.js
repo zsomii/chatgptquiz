@@ -1,123 +1,145 @@
-import express from 'express';
-import cors from 'cors';
-import { openDb } from './database.js';
+const express = require('express');
+const cors = require('cors');
+const db = require('./database');
+const { questions } = require('./questions');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
 app.use(cors());
 app.use(express.json());
 
-// Helper to get 5 random unique question IDs from all questions
-async function getRandomQuestionIds(db, count = 5) {
-  const allIds = await db.all('SELECT id FROM questions');
-  const ids = allIds.map(r => r.id);
-  // Shuffle and pick first 5
-  for (let i = ids.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [ids[i], ids[j]] = [ids[j], ids[i]];
-  }
-  return ids.slice(0, count);
+const QUESTIONS_PER_HOUR = 5;
+
+function getCurrentHourKey() {
+  const now = new Date();
+  return now.toISOString().substring(0, 13); // e.g. '2025-06-20T15'
 }
 
-// GET /api/questions?sessionId=xxx
+function pickRandomQuestions(allQuestions, count) {
+  const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, count);
+}
+
+// Promisify db operations
+function dbGet(sql, params) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+
+function dbRun(sql, params) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
 app.get('/api/questions', async (req, res) => {
-  const sessionId = req.query.sessionId;
-  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
-
   try {
-    const db = await openDb();
+    const sessionId = req.query.sessionId;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
-    // Check if session exists
-    const session = await db.get('SELECT * FROM sessions WHERE sessionId = ?', sessionId);
-    let questionIds;
+    const currentHour = getCurrentHourKey();
+    const session = await dbGet('SELECT * FROM sessions WHERE sessionId = ?', [sessionId]);
 
     if (session) {
-      questionIds = JSON.parse(session.assignedQuestionIds);
+      if (session.answeredHour === currentHour) {
+        return res.json({ answered: true, message: 'Please come back next hour for new questions.' });
+      }
+      if (session.assignedHour === currentHour && session.assignedQuestions) {
+        const assignedIds = JSON.parse(session.assignedQuestions);
+        const qs = questions.filter(q => assignedIds.includes(q.id));
+        return res.json({ questions: qs });
+      }
+    }
+
+    // Assign new questions
+    const selectedQuestions = pickRandomQuestions(questions, QUESTIONS_PER_HOUR);
+    const selectedIds = selectedQuestions.map(q => q.id);
+
+    if (session) {
+      await dbRun(
+        'UPDATE sessions SET assignedHour = ?, assignedQuestions = ?, answeredHour = NULL, score = NULL WHERE sessionId = ?',
+        [currentHour, JSON.stringify(selectedIds), sessionId]
+      );
     } else {
-      // Assign new questions, store session
-      questionIds = await getRandomQuestionIds(db);
-      await db.run('INSERT INTO sessions (sessionId, assignedQuestionIds) VALUES (?, ?)', sessionId, JSON.stringify(questionIds));
+      await dbRun(
+        'INSERT INTO sessions (sessionId, assignedHour, assignedQuestions) VALUES (?, ?, ?)',
+        [sessionId, currentHour, JSON.stringify(selectedIds)]
+      );
     }
 
-    // Get question details
-    const placeholders = questionIds.map(() => '?').join(',');
-    const questions = await db.all(
-      `SELECT id, question, options FROM questions WHERE id IN (${placeholders})`,
-      questionIds
-    );
-
-    // Parse options JSON
-    const formattedQuestions = questions.map(q => ({
-      id: q.id,
-      question: q.question,
-      answers: JSON.parse(q.options),
-    }));
-
-    res.json({ questions: formattedQuestions });
+    res.json({ questions: selectedQuestions });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// POST /api/submit
-// Body: { sessionId, answers: [{ questionId, answerIndex }] }
 app.post('/api/submit', async (req, res) => {
-  const { sessionId, answers } = req.body;
-  if (!sessionId || !answers || !Array.isArray(answers)) {
-    return res.status(400).json({ error: 'Missing sessionId or answers' });
-  }
-
   try {
-    const db = await openDb();
-    const session = await db.get('SELECT * FROM sessions WHERE sessionId = ?', sessionId);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const { sessionId, name, answers } = req.body;
+    if (!sessionId || !name || !answers) return res.status(400).json({ error: 'Missing data' });
 
-    // Prevent multiple submissions in the same hour
-    const now = Date.now();
-    const lastAnswered = session.lastAnsweredAt || 0;
-    if (now - lastAnswered < 60 * 60 * 1000) {
-      return res.status(403).json({ error: 'Already answered in the last hour' });
+    const currentHour = getCurrentHourKey();
+    const session = await dbGet('SELECT * FROM sessions WHERE sessionId = ?', [sessionId]);
+
+    if (!session || session.answeredHour === currentHour) {
+      return res.status(400).json({ error: 'Already answered this hour or no assigned questions' });
     }
 
-    // Get questions assigned to this session
-    const assignedQuestionIds = JSON.parse(session.assignedQuestionIds);
-
-    // Fetch correct answers for assigned questions
-    const placeholders = assignedQuestionIds.map(() => '?').join(',');
-    const questions = await db.all(
-      `SELECT id, correctIndex FROM questions WHERE id IN (${placeholders})`,
-      assignedQuestionIds
-    );
-
-    // Calculate score
-    let totalScore = 0;
-    for (const ans of answers) {
-      if (!assignedQuestionIds.includes(ans.questionId)) {
-        return res.status(400).json({ error: 'Invalid questionId in answers' });
-      }
-      const q = questions.find(q => q.id === ans.questionId);
-      if (q && q.correctIndex === ans.answerIndex) {
-        totalScore++;
-      }
+    const assignedIds = JSON.parse(session.assignedQuestions);
+    if (assignedIds.length !== answers.length) {
+      return res.status(400).json({ error: 'Answer count mismatch' });
     }
 
-    // Update session score and timestamp
-    await db.run(
-      'UPDATE sessions SET score = score + ?, lastAnsweredAt = ? WHERE sessionId = ?',
-      totalScore,
-      now,
-      sessionId
+    let score = 0;
+    for (let i = 0; i < assignedIds.length; i++) {
+      const q = questions.find(q => q.id === assignedIds[i]);
+      if (q && q.correctIndex === answers[i]) score++;
+    }
+
+    await dbRun(
+      'UPDATE sessions SET answeredHour = ?, score = ?, name = ? WHERE sessionId = ?',
+      [currentHour, score, name, sessionId]
     );
 
-    res.json({ totalScore, scoreThisSubmit: totalScore });
+    await dbRun(
+      'INSERT INTO scores (name, score, answeredHour) VALUES (?, ?, ?)',
+      [name, score, currentHour]
+    );
+
+    res.json({ totalScore: score });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+app.get('/api/toplist', async (req, res) => {
+  try {
+    db.all(
+      `SELECT name, MAX(score) as score 
+      FROM scores 
+      GROUP BY name 
+      ORDER BY score DESC 
+      LIMIT 10`,
+      [],
+      (err, rows) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'Internal server error' });
+          return;
+        }
+        res.json({ toplist: rows });
+      }
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
+
+const port = process.env.PORT || 4000;
+app.listen(port, () => console.log(`Server running on port ${port}`));

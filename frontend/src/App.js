@@ -1,201 +1,171 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { v4 as uuidv4 } from 'uuid';
+// frontend/src/App.js
+import React, { useState, useEffect } from 'react';
+import './App.css';
 
-function getSessionId() {
-  let sessionId = localStorage.getItem('sessionId');
-  if (!sessionId) {
-    sessionId = uuidv4();
-    localStorage.setItem('sessionId', sessionId);
-  }
-  return sessionId;
+function generateSessionId() {
+  return 'xxxxxx'.replace(/x/g, () =>
+    Math.floor(Math.random() * 16).toString(16)
+  );
 }
 
-function formatCountdown(diffMs) {
-  const totalSeconds = Math.max(0, Math.floor(diffMs / 1000));
-  const m = Math.floor(totalSeconds / 60);
-  const s = totalSeconds % 60;
-  return `${m} perc ${s} mp múlva új kérdések.`;
-}
-
-export default function Quiz() {
+function App() {
+  const [name, setName] = useState(localStorage.getItem('quizName') || '');
+  const [sessionId, setSessionId] = useState(localStorage.getItem('sessionId') || null);
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
   const [score, setScore] = useState(null);
   const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [countdown, setCountdown] = useState(null);
-  const countdownInterval = useRef(null);
-
-  const sessionId = getSessionId();
-
-  // Start countdown timer to next hour
-  function startCountdown() {
-    if (countdownInterval.current) clearInterval(countdownInterval.current);
-
-    function update() {
-      const now = new Date();
-      const nextHour = new Date(now);
-      nextHour.setHours(now.getHours() + 1, 0, 0, 0);
-      const diff = nextHour - now;
-      if (diff <= 0) {
-        clearInterval(countdownInterval.current);
-        setCountdown(null);
-        window.location.reload(); // Reload to fetch new questions
-      } else {
-        setCountdown(formatCountdown(diff));
-      }
-    }
-
-    update();
-    countdownInterval.current = setInterval(update, 1000);
-  }
+  const [message, setMessage] = useState(null);
+  const [toplist, setToplist] = useState([]);
 
   useEffect(() => {
-    async function fetchQuestions() {
-      try {
-        setLoading(true);
-        setError(null);
-        setScore(null);
-        setCountdown(null);
-
-        const res = await fetch(`/api/questions?sessionId=${sessionId}`);
-        if (!res.ok) throw new Error('Nem sikerült betölteni a kérdéseket.');
-
-        const data = await res.json();
-
-        if (!data.questions || data.questions.length === 0) {
-          setQuestions([]);
-          setError('Ebben az órában nincs kérdés. Kérlek várj.');
-          startCountdown();
-          return;
-        }
-
-        setQuestions(data.questions);
-      } catch (e) {
-        setError(e.message);
-      } finally {
-        setLoading(false);
-      }
+    if (!sessionId) {
+      const sid = generateSessionId();
+      localStorage.setItem('sessionId', sid);
+      setSessionId(sid);
     }
-
-    fetchQuestions();
-
-    return () => {
-      if (countdownInterval.current) clearInterval(countdownInterval.current);
-    };
   }, [sessionId]);
 
-  function handleAnswer(questionId, answerIndex) {
-    setAnswers((prev) => ({ ...prev, [questionId]: answerIndex }));
+  useEffect(() => {
+    if (!sessionId || !name) return;
+
+    fetch(`/api/questions?sessionId=${sessionId}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          setError(data.error);
+        } else if (data.answered) {
+          setMessage(data.message);
+          setQuestions([]);
+          setScore(null);
+        } else {
+          setQuestions(data.questions);
+          setScore(null);
+          setMessage(null);
+          setAnswers({});
+        }
+      })
+      .catch(() => setError('Failed to fetch questions'));
+
+    fetch('/api/toplist')
+      .then(res => res.json())
+      .then(data => setToplist(data.toplist || []))
+      .catch(() => setToplist([]));
+  }, [sessionId, name]);
+
+  function handleAnswerChange(qId, answerIdx) {
+    setAnswers(prev => ({ ...prev, [qId]: answerIdx }));
   }
 
-  async function handleSubmit() {
+  function handleSubmit(e) {
+    e.preventDefault();
     if (Object.keys(answers).length !== questions.length) {
-      alert('Kérem válaszolja meg az összes kérdést!');
+      alert('Kérlek válaszolj az összes kérdésre!');
       return;
     }
-    try {
-      setLoading(true);
-      const res = await fetch('/api/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          answers: Object.entries(answers).map(([qId, ansIndex]) => ({
-            questionId: parseInt(qId),
-            answerIndex: ansIndex,
-          })),
-        }),
-      });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        setError(data.error || 'Beküldési hiba');
-        return;
-      }
-
-      setScore(data.totalScore);
-      setError(null);
-
-      // If scoreThisSubmit === 0 (means no points or already submitted?), start countdown to next hour
-      if (data.scoreThisSubmit === 0) {
-        startCountdown();
-      }
-    } catch (e) {
-      setError('Hiba történt a beküldés során');
-    } finally {
-      setLoading(false);
-    }
+    fetch('/api/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        name,
+        answers: questions.map(q => answers[q.id]),
+      }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          setError(data.error);
+          setScore(null);
+        } else {
+          setScore(data.totalScore);
+          setMessage(null);
+          // Refresh toplist
+          fetch('/api/toplist')
+            .then(res => res.json())
+            .then(data => setToplist(data.toplist || []));
+        }
+      })
+      .catch(() => setError('Hiba a beküldés közben'));
   }
 
-  // JSX rendering
-
-  if (loading) return <p>Betöltés...</p>;
-
-  if (error && !countdown) return <p className="error">{error}</p>;
-
-  if (countdown)
-    return <div className="countdown" style={{ fontWeight: 'bold', fontSize: 18 }}>{countdown}</div>;
-
-  if (score !== null) {
+  if (!name) {
     return (
-      <div>
-        <h2>Kvíz vége!</h2>
-        <p>Összpontszám: {score} / {questions.length}</p>
-        <button onClick={() => window.location.reload()}>Újra játszom</button>
+      <div className="container">
+        <h1>Esküvői Kvíz</h1>
+        <label>
+          Kérlek add meg a neved:
+          <input
+            type="text"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && name.trim()) {
+                localStorage.setItem('quizName', name.trim());
+                setName(name.trim());
+              }
+            }}
+          />
+        </label>
+        <button
+          disabled={!name.trim()}
+          onClick={() => {
+            localStorage.setItem('quizName', name.trim());
+            setName(name.trim());
+          }}
+        >
+          Mehet
+        </button>
       </div>
     );
   }
 
   return (
-    <div className="quiz-container">
+    <div className="container">
       <h1>Esküvői Kvíz</h1>
-      <p>Üdvözöllek! Válaszolj az alábbi kérdésekre:</p>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          handleSubmit();
-        }}
-      >
-        {questions.map((q) => (
-          <div key={q.id} className="question-block" style={{ marginBottom: '1.5em' }}>
-            <p>{q.question}</p>
-            {q.answers.map((answer, i) => (
-              <label key={i} className="answer-label" style={{ display: 'block', cursor: 'pointer' }}>
-                <input
-                  type="radio"
-                  name={`q_${q.id}`}
-                  value={i}
-                  checked={answers[q.id] === i}
-                  onChange={() => handleAnswer(q.id, i)}
-                  disabled={score !== null}
-                />
-                {' '}
-                {answer}
-              </label>
-            ))}
-          </div>
-        ))}
+      {error && <div className="error">{error}</div>}
+      {message && <div className="message">{message}</div>}
 
-        {!score && (
-          <button
-            type="submit"
-            disabled={loading}
-            style={{
-              padding: '10px 20px',
-              fontSize: '1em',
-              cursor: loading ? 'not-allowed' : 'pointer',
-              backgroundColor: '#007bff',
-              color: 'white',
-              border: 'none',
-              borderRadius: '5px',
-            }}
-          >
-            {loading ? 'Beküldés...' : 'Beküldés'}
-          </button>
-        )}
-      </form>
+      {score === null && questions.length > 0 && (
+        <form onSubmit={handleSubmit}>
+          {questions.map(q => (
+            <div key={q.id} className="question-block">
+              <p>{q.question}</p>
+              {q.answers.map((a, idx) => (
+                <label key={idx}>
+                  <input
+                    type="radio"
+                    name={`q${q.id}`}
+                    value={idx}
+                    checked={answers[q.id] === idx}
+                    onChange={() => handleAnswerChange(q.id, idx)}
+                  />
+                  {a}
+                </label>
+              ))}
+            </div>
+          ))}
+          <button type="submit">Beküld</button>
+        </form>
+      )}
+
+      {score !== null && (
+        <div className="score-message">
+          <h2>Az eredményed: {score} / {questions.length}</h2>
+        </div>
+      )}
+
+      <h2>Toplista</h2>
+      <ol>
+        {toplist.map((entry, i) => (
+          <li key={i}>
+            {entry.name} - {entry.score}
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
+
+export default App;
