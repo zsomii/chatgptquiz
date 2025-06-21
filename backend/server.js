@@ -1,238 +1,123 @@
-const express = require('express');
-const cors = require('cors');
-const db = require('./database');
-const questions = require('./questions');
+import express from 'express';
+import cors from 'cors';
+import { openDb } from './database.js';
 
 const app = express();
+const PORT = process.env.PORT || 3001;
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 5000;
-
-// --- DB Setup ---
-
-// Create questions table (store full 100 questions)
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS questions (
-    id INTEGER PRIMARY KEY,
-    question TEXT NOT NULL,
-    answer0 TEXT NOT NULL,
-    answer1 TEXT NOT NULL,
-    answer2 TEXT NOT NULL,
-    answer3 TEXT NOT NULL,
-    correctAnswer INTEGER NOT NULL
-  )
-`).run();
-
-// Store assigned question sets per user per hour
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS user_question_sets (
-    sessionId TEXT NOT NULL,
-    hour INTEGER NOT NULL,
-    questionId INTEGER NOT NULL,
-    PRIMARY KEY(sessionId, hour, questionId)
-  )
-`).run();
-
-// Store user answers
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS user_answers (
-    sessionId TEXT NOT NULL,
-    questionId INTEGER NOT NULL,
-    answerIndex INTEGER NOT NULL,
-    PRIMARY KEY(sessionId, questionId)
-  )
-`).run();
-
-// Store total user scores
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS user_scores (
-    sessionId TEXT PRIMARY KEY,
-    totalScore INTEGER NOT NULL DEFAULT 0
-  )
-`).run();
-
-// Seed questions if empty
-const count = db.prepare('SELECT COUNT(*) as cnt FROM questions').get().cnt;
-if (count === 0) {
-  const insert = db.prepare(`
-    INSERT INTO questions (id, question, answer0, answer1, answer2, answer3, correctAnswer)
-    VALUES (@id, @question, @answer0, @answer1, @answer2, @answer3, @correctAnswer)
-  `);
-  const insertMany = db.transaction((questions) => {
-    for (const q of questions) {
-      insert.run({
-        id: q.id,
-        question: q.question,
-        answer0: q.answers[0],
-        answer1: q.answers[1],
-        answer2: q.answers[2],
-        answer3: q.answers[3],
-        correctAnswer: q.correctAnswer,
-      });
-    }
-  });
-  insertMany(questions);
-  console.log('Seeded questions into DB');
+// Helper to get 5 random unique question IDs from all questions
+async function getRandomQuestionIds(db, count = 5) {
+  const allIds = await db.all('SELECT id FROM questions');
+  const ids = allIds.map(r => r.id);
+  // Shuffle and pick first 5
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  return ids.slice(0, count);
 }
 
-// Helper: get current hour timestamp (e.g. YYYYMMDDHH)
-function getCurrentHour() {
-  const d = new Date();
-  return d.getFullYear() * 1000000 + (d.getMonth() + 1) * 10000 + d.getDate() * 100 + d.getHours();
-}
-
-// API: Get 5 questions assigned for user this hour, or assign new 5 if none
-app.get('/api/questions', (req, res) => {
+// GET /api/questions?sessionId=xxx
+app.get('/api/questions', async (req, res) => {
   const sessionId = req.query.sessionId;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
-  const hour = getCurrentHour();
+  try {
+    const db = await openDb();
 
-  // Check if user has assigned questions this hour
-  const assigned = db.prepare(`
-    SELECT questionId FROM user_question_sets WHERE sessionId = ? AND hour = ?
-  `).all(sessionId, hour);
+    // Check if session exists
+    const session = await db.get('SELECT * FROM sessions WHERE sessionId = ?', sessionId);
+    let questionIds;
 
-  if (assigned.length === 5) {
-    // Fetch question data for these 5 ids
-    const questionsData = db.prepare(`
-      SELECT * FROM questions WHERE id IN (${assigned.map(() => '?').join(',')})
-    `).all(...assigned.map(a => a.questionId));
+    if (session) {
+      questionIds = JSON.parse(session.assignedQuestionIds);
+    } else {
+      // Assign new questions, store session
+      questionIds = await getRandomQuestionIds(db);
+      await db.run('INSERT INTO sessions (sessionId, assignedQuestionIds) VALUES (?, ?)', sessionId, JSON.stringify(questionIds));
+    }
 
-    const formatted = questionsData.map(q => ({
+    // Get question details
+    const placeholders = questionIds.map(() => '?').join(',');
+    const questions = await db.all(
+      `SELECT id, question, options FROM questions WHERE id IN (${placeholders})`,
+      questionIds
+    );
+
+    // Parse options JSON
+    const formattedQuestions = questions.map(q => ({
       id: q.id,
       question: q.question,
-      answers: [q.answer0, q.answer1, q.answer2, q.answer3],
+      answers: JSON.parse(q.options),
     }));
 
-    return res.json({ questions: formatted });
+    res.json({ questions: formattedQuestions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
   }
-
-  if (assigned.length > 0 && assigned.length < 5) {
-    // Edge case: incomplete assignment, clean and reassign
-    db.prepare(`DELETE FROM user_question_sets WHERE sessionId = ? AND hour = ?`).run(sessionId, hour);
-  }
-
-  // Assign 5 random unique questions to user for this hour
-  const allQuestionIds = db.prepare('SELECT id FROM questions').all().map(q => q.id);
-
-  // Pick 5 random unique questions
-  const shuffled = allQuestionIds.sort(() => 0.5 - Math.random());
-  const selectedIds = shuffled.slice(0, 5);
-
-  // Insert assignment into user_question_sets
-  const insertAssignment = db.prepare(`
-    INSERT INTO user_question_sets (sessionId, hour, questionId)
-    VALUES (?, ?, ?)
-  `);
-
-  const insertMany = db.transaction(() => {
-    for (const qid of selectedIds) {
-      insertAssignment.run(sessionId, hour, qid);
-    }
-  });
-
-  insertMany();
-
-  // Fetch questions for these IDs
-  const questionsData = db.prepare(`
-    SELECT * FROM questions WHERE id IN (${selectedIds.map(() => '?').join(',')})
-  `).all(...selectedIds);
-
-  const formatted = questionsData.map(q => ({
-    id: q.id,
-    question: q.question,
-    answers: [q.answer0, q.answer1, q.answer2, q.answer3],
-  }));
-
-  return res.json({ questions: formatted });
 });
 
-// API: Submit answers for current hour questions
-app.post('/api/submit', (req, res) => {
+// POST /api/submit
+// Body: { sessionId, answers: [{ questionId, answerIndex }] }
+app.post('/api/submit', async (req, res) => {
   const { sessionId, answers } = req.body;
   if (!sessionId || !answers || !Array.isArray(answers)) {
     return res.status(400).json({ error: 'Missing sessionId or answers' });
   }
 
-  const hour = getCurrentHour();
+  try {
+    const db = await openDb();
+    const session = await db.get('SELECT * FROM sessions WHERE sessionId = ?', sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  // Get assigned questions for this user this hour
-  const assigned = db.prepare(`
-    SELECT questionId FROM user_question_sets WHERE sessionId = ? AND hour = ?
-  `).all(sessionId, hour);
-
-  if (assigned.length !== 5) {
-    return res.status(400).json({ error: 'No assigned questions found for this hour' });
-  }
-
-  // Make sure submitted answers correspond to assigned questions
-  const assignedIds = new Set(assigned.map(a => a.questionId));
-
-  // Check user_answers to avoid double scoring same question
-  const alreadyAnswered = new Set(
-    db.prepare(`
-      SELECT questionId FROM user_answers WHERE sessionId = ?
-    `).all(sessionId).map(r => r.questionId)
-  );
-
-  let scoreThisSubmit = 0;
-
-  const insertAnswer = db.prepare(`
-    INSERT OR IGNORE INTO user_answers (sessionId, questionId, answerIndex)
-    VALUES (?, ?, ?)
-  `);
-
-  const getQuestion = db.prepare('SELECT correctAnswer FROM questions WHERE id = ?');
-
-  for (const ans of answers) {
-    const { questionId, answerIndex } = ans;
-    if (!assignedIds.has(questionId)) {
-      // Ignore answers for questions not assigned
-      continue;
-    }
-    if (alreadyAnswered.has(questionId)) {
-      // Already answered this question before, skip
-      continue;
-    }
-    const q = getQuestion.get(questionId);
-    if (!q) continue;
-
-    if (q.correctAnswer === answerIndex) {
-      scoreThisSubmit++;
+    // Prevent multiple submissions in the same hour
+    const now = Date.now();
+    const lastAnswered = session.lastAnsweredAt || 0;
+    if (now - lastAnswered < 60 * 60 * 1000) {
+      return res.status(403).json({ error: 'Already answered in the last hour' });
     }
 
-    insertAnswer.run(sessionId, questionId, answerIndex);
+    // Get questions assigned to this session
+    const assignedQuestionIds = JSON.parse(session.assignedQuestionIds);
+
+    // Fetch correct answers for assigned questions
+    const placeholders = assignedQuestionIds.map(() => '?').join(',');
+    const questions = await db.all(
+      `SELECT id, correctIndex FROM questions WHERE id IN (${placeholders})`,
+      assignedQuestionIds
+    );
+
+    // Calculate score
+    let totalScore = 0;
+    for (const ans of answers) {
+      if (!assignedQuestionIds.includes(ans.questionId)) {
+        return res.status(400).json({ error: 'Invalid questionId in answers' });
+      }
+      const q = questions.find(q => q.id === ans.questionId);
+      if (q && q.correctIndex === ans.answerIndex) {
+        totalScore++;
+      }
+    }
+
+    // Update session score and timestamp
+    await db.run(
+      'UPDATE sessions SET score = score + ?, lastAnsweredAt = ? WHERE sessionId = ?',
+      totalScore,
+      now,
+      sessionId
+    );
+
+    res.json({ totalScore, scoreThisSubmit: totalScore });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
   }
-
-  // Update total score
-  const existingScore = db.prepare('SELECT totalScore FROM user_scores WHERE sessionId = ?').get(sessionId);
-
-  if (existingScore) {
-    db.prepare('UPDATE user_scores SET totalScore = totalScore + ? WHERE sessionId = ?').run(scoreThisSubmit, sessionId);
-  } else {
-    db.prepare('INSERT INTO user_scores (sessionId, totalScore) VALUES (?, ?)').run(sessionId, scoreThisSubmit);
-  }
-
-  const updatedScore = db.prepare('SELECT totalScore FROM user_scores WHERE sessionId = ?').get(sessionId);
-
-  res.json({
-    message: 'Answers submitted',
-    scoreThisSubmit,
-    totalScore: updatedScore.totalScore,
-  });
-});
-
-// API: Leaderboard (top 10 by totalScore)
-app.get('/api/leaderboard', (req, res) => {
-  const leaderboard = db.prepare(`
-    SELECT sessionId, totalScore FROM user_scores ORDER BY totalScore DESC LIMIT 10
-  `).all();
-
-  res.json(leaderboard);
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
